@@ -1,5 +1,8 @@
 # @GonzaloMartinGarcia
 # This file houses our dataset mixer and training dataset classes.
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 import torch
 from torch.utils.data import Dataset
@@ -11,366 +14,332 @@ import random
 import pandas as pd
 import cv2
 
-#################
-# Dataset Mixer
-#################
 
-class MixedDataLoader:
-    def __init__(self, loader1, loader2, split1=9, split2=1):
-        self.loader1 = loader1
-        self.loader2 = loader2
-        self.split1 = split1
-        self.split2 = split2
-        self.frac1, self.frac2 = self.get_split_fractions()
-        self.randchoice1=None
+from dataloader.utils import read_text_lines
+from dataloader.file_io import *
 
-    def __iter__(self):
-        self.loader_iter1 = iter(self.loader1)
-        self.loader_iter2 = iter(self.loader2)
-        self.randchoice1 = self.create_split()
-        self.indx = 0
-        return self
+from skimage import io, transform
+import numpy as np
+import glob
+import tqdm
+from PIL import Image
+import torch
+from imgaug import augmenters as iaa
+import pandas as pd
+from torch.utils.data import DataLoader
+
     
-    def get_split_fractions(self):
-        size1 = len(self.loader1)
-        size2 = len(self.loader2)
-        effective_fraction1 = min((size2/size1) * (self.split1/self.split2), 1) 
-        effective_fraction2 = min((size1/size2) * (self.split2/self.split1), 1) 
-        print("Effective fraction for loader1: ", effective_fraction1)
-        print("Effective fraction for loader2: ", effective_fraction2)
-        return effective_fraction1, effective_fraction2
+def read_img(filename):
+    img = np.array(Image.open(filename).convert('RGB'))
+    return img
 
-    def create_split(self):
-        randchoice1 = [True]*int(len(self.loader1)*self.frac1) + [False]*int(len(self.loader2)*self.frac2)
-        np.random.shuffle(randchoice1)
-        return randchoice1
 
-    def __next__(self):
-        if self.indx == len(self.randchoice1):
-            raise StopIteration
-        if self.randchoice1[self.indx]:
-            self.indx += 1
-            return next(self.loader_iter1)
-        else:
-            self.indx += 1
-            return next(self.loader_iter2)
-        
-    def __len__(self):
-        return int(len(self.loader1)*self.frac1) + int(len(self.loader2)*self.frac2)
+def read_synthesis_depth_png(file_path, mask_threshold=50000):
+    """
+    Reads a 16-bit grayscale PNG depth image and converts it to a normalized floating-point depth map.
     
-
-#################
-# Transforms 
-#################
-
-# Hyperism
-class SynchronizedTransform_Hyper:
-    def __init__(self, H, W):
-        self.resize          = transforms.Resize((H,W))
-        self.resize_depth    = transforms.Resize((H,W), interpolation=Image.NEAREST)
-        self.horizontal_flip = transforms.RandomHorizontalFlip(p=1.0)
-        self.to_tensor       = transforms.ToTensor()
-
-    def __call__(self, rgb_image, depth_image, normal_image=None):
-        # h-flip
-        if random.random() > 0.5:
-            rgb_image = self.horizontal_flip(rgb_image)
-            depth_image = self.horizontal_flip(depth_image)
-            if normal_image is not None:
-                normal_image = self.horizontal_flip(normal_image)
-                # correct normals for horizontal flip
-                np_normal_image = np.array(normal_image)
-                np_normal_image[:, :, 0] = 255 - np_normal_image[:, :, 0]
-                normal_image = Image.fromarray(np_normal_image)
-        # resize
-        rgb_image   = self.resize(rgb_image)
-        depth_image = self.resize_depth(depth_image)
-        if normal_image is not None:
-            normal_image = self.resize(normal_image)
-        # to tensor
-        rgb_tensor = self.to_tensor(rgb_image)
-        depth_tensor = self.to_tensor(depth_image)
-        if normal_image is not None:
-            normal_tensor = self.to_tensor(normal_image)
-        # retrun
-        if normal_image is not None:
-            return rgb_tensor, depth_tensor, normal_tensor
-        return rgb_tensor, depth_tensor
+    Args:
+        file_path (str): Path to the 16-bit PNG depth image.
     
-# Virtual KITTI 2
-class SynchronizedTransform_VKITTI:
-    def __init__(self):
-        self.to_tensor = transforms.ToTensor()
-        self.horizontal_flip = transforms.RandomHorizontalFlip(p=1.0)
-
-    # KITTI benchmark crop from Marigold:
-    # https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/dataset/kitti_dataset.py#L75
-    @staticmethod
-    def kitti_benchmark_crop(input_img):
-        KB_CROP_HEIGHT = 352
-        KB_CROP_WIDTH = 1216
-        height, width = input_img.shape[-2:]
-        top_margin = int(height - KB_CROP_HEIGHT)
-        left_margin = int((width - KB_CROP_WIDTH) / 2)
-        if 2 == len(input_img.shape):
-            out = input_img[
-                top_margin : top_margin + KB_CROP_HEIGHT,
-                left_margin : left_margin + KB_CROP_WIDTH,
-            ]
-        elif 3 == len(input_img.shape):
-            out = input_img[
-                :,
-                top_margin : top_margin + KB_CROP_HEIGHT,
-                left_margin : left_margin + KB_CROP_WIDTH,
-            ]
-        return out
+    Returns:
+        depth_norm (np.ndarray): Depth values normalized to the [0, 1] range.
+    """
+    # Read the image with unchanged flag to preserve 16-bit depth
+    depth_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+    if depth_image is None:
+        raise ValueError(f"Failed to load image at {file_path}")
     
-    def __call__(self, rgb_image, depth_image, normal_image=None):
-        # h-flip
-        if random.random() > 0.5:
-            rgb_image = self.horizontal_flip(rgb_image)
-            depth_image = self.horizontal_flip(depth_image)
-            if normal_image is not None:
-                normal_image = self.horizontal_flip(normal_image)
-                # correct normals for horizontal flip
-                np_normal_image = np.array(normal_image)
-                np_normal_image[:, :, 0] = 255 - np_normal_image[:, :, 0]
-                normal_image = Image.fromarray(np_normal_image)
-        # to tensor
-        rgb_tensor = self.to_tensor(rgb_image)      
-        depth_tensor = self.to_tensor(depth_image)  
-        if normal_image is not None:
-            normal_tensor = self.to_tensor(normal_image)
-        # kitti benchmark crop
-        rgb_tensor = self.kitti_benchmark_crop(rgb_tensor)
-        depth_tensor = self.kitti_benchmark_crop(depth_tensor)
-        if normal_image is not None:
-            normal_tensor = self.kitti_benchmark_crop(normal_tensor)
-        # return
-        if normal_image is not None:
-            return rgb_tensor, depth_tensor, normal_tensor
-        return rgb_tensor, depth_tensor
+    # Verify that the image is indeed 16-bit
+    if depth_image.dtype != np.uint16:
+        raise ValueError("Image is not 16-bit")
     
+    # get mask from depth, max value is invalid depth, set it to 0
+    mask = depth_image <= mask_threshold
 
-#####################
-# Training Datasets
-#####################
-
-# Hypersim   
-class Hypersim(Dataset):
-    def __init__(self, root_dir, transform=True, near_plane=1e-5, far_plane=65.0):
-        self.root_dir   = root_dir
-        self.split_path = os.path.join("data/hypersim/processed/train/filename_meta_train.csv")
-        self.near_plane = near_plane
-        self.far_plane  = far_plane
-        self.align_cam_normal = True
-        self.pairs = self._find_pairs()
-        self.transform =  SynchronizedTransform_Hyper(H=480, W=640) if transform else None
-
-    def _find_pairs(self):
-        df = pd.read_csv(self.split_path)
-        pairs = []
-        for _, row in df.iterrows():
-            if row['included_in_public_release'] and (row['split_partition_name'] == "train"):
-                rgb_path = os.path.join(self.root_dir, "train", row['rgb_path'])
-                depth_path = os.path.join(self.root_dir, "train", row['depth_path'])
-                head, _ = os.path.split(os.path.join(self.root_dir, "train"))
-                normal_dir = os.path.join(os.path.join(head, 'normals'), row['scene_name'], 'images', f'scene_{row["camera_name"]}_geometry_preview',f'frame.{str(row["frame_id"]).zfill(4) }.normal_cam.png')
-                if os.path.exists(rgb_path) and os.path.exists(depth_path) and os.path.exists(normal_dir):
-                    pair_info = {'rgb_path': rgb_path, 'depth_path': depth_path, 'normal_path': normal_dir}    
-                    pairs.append(pair_info)
-        return pairs
-
-    def __len__(self):
-        return len(self.pairs)
+    # Convert the 16-bit image to floating-point and normalize to [0, 1]
+    depth_norm = depth_image.astype(np.float32) / 65535.0
     
-    # Some Hypersim normals are not properly oriented towards the camera.
-    # The align_normals and creat_uv_mesh functions are from GeoWizard
-    # https://github.com/fuxiao0719/GeoWizard/blob/5ff496579c6be35d9d86fe4d0760a6b5e6ba25c5/geowizard/training/dataloader/file_io.py#L115
-    def align_normals(self, normal, depth, K, H, W):
-            '''
-            Orientation of surface normals in hypersim is not always consistent
-            see https://github.com/apple/ml-hypersim/issues/26
-            '''
-            # inv K
-            K = np.array([[K[0],    0, K[2]], 
-                          [   0, K[1], K[3]], 
-                          [   0,    0,    1]])
-            inv_K = np.linalg.inv(K)
-            # reprojection depth to camera points
-            xy = self.creat_uv_mesh(H, W)
-            points = np.matmul(inv_K[:3, :3], xy).reshape(3, H, W)
-            points = depth * points
-            points = points.transpose((1,2,0))
-            # align normal
-            orient_mask = np.sum(normal * points, axis=2) > 0
-            normal[orient_mask] *= -1
-            return normal   
+    return depth_norm, mask
+
+def read_synthesis_depth_8bit_png(file_path, mask_threshold=128):
+    """
+    Reads a 16-bit grayscale PNG depth image and converts it to a normalized floating-point depth map.
     
-    def creat_uv_mesh(self, H, W):
-        y, x = np.meshgrid(np.arange(0, H, dtype=np.float64), np.arange(0, W, dtype=np.float64), indexing='ij')
-        meshgrid = np.stack((x,y))
-        ones = np.ones((1,H*W), dtype=np.float64)
-        xy = meshgrid.reshape(2, -1)
-        return np.concatenate([xy, ones], axis=0)
+    Args:
+        file_path (str): Path to the 16-bit PNG depth image.
     
-    def __getitem__(self, idx):
-        pairs = self.pairs[idx]
+    Returns:
+        depth_norm (np.ndarray): Depth values normalized to the [0, 1] range.
+    """
+    # Read the image with unchanged flag to preserve 16-bit depth
+    depth_image =cv2.imread(str(file_path), cv2.IMREAD_GRAYSCALE)
 
-        # get RGB
-        rgb_path   = pairs['rgb_path']
-        rgb_image  = Image.open(rgb_path).convert('RGB')
-        # get depth
-        depth_path  = pairs['depth_path']
-        depth_image = Image.open(depth_path)
-        depth_image = np.array(depth_image)        
-        depth_image = depth_image / 1000 # mm to meters
-        depth_image = Image.fromarray(depth_image)
-        # get normals
-        normal_path = pairs['normal_path']
-        normal_image = Image.open(normal_path).convert('RGB')
-        if self.align_cam_normal:
-            # align normals towards camera
-            normal_array = (np.array(normal_image) / 255.0) * 2.0 - 1.0
-            H, W = normal_array.shape[:2]
-            normal_array[:,:,1:] *= -1
-            normal_array = self.align_normals(normal_array, np.array(depth_image), [886.81,886.81,W/2, H/2], H, W) * -1
-            normal_image = Image.fromarray(((normal_array + 1.0) / 2.0 * 255).astype(np.uint8))
- 
-        # transfrom
-        if self.transform is not None:
-            rgb_tensor, depth_tensor, normal_tensor = self.transform(rgb_image, depth_image, normal_image)
-        else:
-            rgb_tensor    = transforms.ToTensor()(rgb_image)
-            depth_tensor  = transforms.ToTensor()(depth_image)
-            normal_tensor = transforms.ToTensor()(normal_image)
+    if depth_image is None:
+        raise ValueError(f"Failed to load image at {file_path}")
+    
+    # Verify that the image is indeed 16-bit
+    if depth_image.dtype != np.uint16:
+        raise ValueError("Image is not 16-bit")
+    
+    # get mask from depth, max value is valid depth, set it to 1
+    mask = depth_image <= mask_threshold
 
-        # get valid depth mask
-        valid_depth_mask = (depth_tensor > self.near_plane) & (depth_tensor < self.far_plane)
+    # Convert the 16-bit image to floating-point and normalize to [0, 1]
+    depth_norm = depth_image.astype(np.float32) / 255.0
+    
+    return depth_norm, mask
 
-        # Process RGB 
-        rgb_tensor  = rgb_tensor*2.0 - 1.0 # [-1,1]
+def read_synthesis_normal_png(file_path):
+    # Open and convert the image to RGB
+    normal_image = Image.open(file_path).convert('RGB').resize((512, 512), resample=Image.NEAREST)
 
-        # Process depth
-        if valid_depth_mask.any():
-            flat_depth = depth_tensor[valid_depth_mask].flatten().float()
-            min_depth = torch.quantile(flat_depth, 0.02)  
-            max_depth = torch.quantile(flat_depth, 0.98)
-            if min_depth == max_depth:
-                depth_tensor     = torch.zeros_like(depth_tensor)
-                metric_tensor    = torch.zeros_like(depth_tensor)
-                valid_depth_mask = torch.zeros_like(depth_tensor).bool() # empty mask
-            else:
-                depth_tensor = torch.clamp(depth_tensor, min_depth, max_depth) # remove outliers
-                depth_tensor[~valid_depth_mask] = max_depth                    # set invalid depth to relative far plane
-                metric_tensor = depth_tensor.clone()                           # keep metric depth for e2e loss ft   
-                depth_tensor = torch.clamp((((depth_tensor - min_depth) / (max_depth - min_depth))*2.0)-1.0, -1, 1) # [-1,1]
-        else:
-            depth_tensor = torch.zeros_like(depth_tensor)
-            metric_tensor = torch.zeros_like(depth_tensor)
-        depth_tensor   = torch.stack([depth_tensor, depth_tensor, depth_tensor]).squeeze() # stack depth map for VAE encoder
+    # Convert to NumPy array and normalize to [0, 1]
+    normal_array = np.array(normal_image).astype(np.float32) / 255
 
-        # Process normals
-        normal_tensor = normal_tensor * 2.0 - 1.0                                 # [-1,1]
-        normal_tensor =  torch.nn.functional.normalize(normal_tensor, p=2, dim=0) # normalize
-        # set invalid pixels to the zero vector (color grey)
-        normal_tensor[0,~valid_depth_mask.squeeze()] = 0
-        normal_tensor[1,~valid_depth_mask.squeeze()] = 0
-        normal_tensor[2,~valid_depth_mask.squeeze()] = 0
+    # Split into R, G, B channels
+    r = normal_array[:, :, 0]
+    g = normal_array[:, :, 1]
+    b = normal_array[:, :, 2]
+
+    # Decode to [-1, 1] range
+    px = r * 2.0 - 1.0
+    py = g * 2.0 - 1.0
+    pz = b * 2.0 - 1.0
+
+    # Compute magnitude and normalize
+    magnitude = np.sqrt(px**2 + py**2 + pz**2) + 1e-10  # Avoid division by zero
+    nx = px / magnitude
+    ny = py / magnitude
+    nz = pz / magnitude
+
+    # Stack normalized components
+    normalized_normal_map = np.stack((nx, ny, nz), axis=2)
+    normalized_normal_map *= -1
+    return normalized_normal_map
+
+def read_photoface_dataset(depth_path, normal_path, mask_path):
+    normal_map = np.load(normal_path)
+    normal_map = change_axis_coordinate(normal_map)
+
+    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    depth_norm = depth.astype(np.float32) / 65535.0
+    # read mask as grayscale image
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    # 255 is for valid pixel, 0 is for invalid pixel
+    mask = mask == 255
+    depth_norm[~mask] = 10.
+    normal_map[~mask] = np.array([0., 0., -1.])
+    return depth_norm, normal_map, mask
+
+    
+def change_axis_coordinate(normal):
+    tt = np.zeros_like(normal)
+    tt[:, :, 0] = normal[:, :, 1]
+    tt[:, :, 1] = normal[:, :, 0]
+    tt[:, :, 2] = -normal[:, :, 2]
+    return tt
+
+def read_depth_normal_synthesis(depth_path, normal_path):
+    depth, mask = read_synthesis_depth_png(depth_path)
+    depth[~mask] = 10.
+    normal = read_synthesis_normal_png(normal_path)
+    normal[~mask] = np.array([0., 0., -1.])
+    return depth, normal, mask
+
+
+class SynthesisDataset(Dataset):
+    def __init__(self, data_dir, csv_path, dataset_name = "synthesis",
+                 transform=None):
+        super(SynthesisDataset, self).__init__()
+
+        self.data_dir = data_dir
+        print("data dir: ", self.data_dir)
+        self.transform = transform
+        self.img_size = (768, 768)
+        self.csv_path = csv_path
+        self.dataset_name = dataset_name
+        self.samples = []
+
+        # read data path from csv file with 3 headers (dataset, rgb, depth, normal)
+        self.data_info = pd.read_csv(csv_path, header=None)
+        self.num_img = len(self.data_info)
+        print("Number of train images: ", self.num_img)
+
+
+
+        self.samples = []
+        for image_idx in range(self.num_img):
+            sample = dict()
+            sample['rgb'] = os.path.join(self.data_dir, self.data_info.iloc[image_idx, 0])
+            sample['depth'] = os.path.join(self.data_dir, self.data_info.iloc[image_idx, 1])
+            sample['normal'] = os.path.join(self.data_dir, self.data_info.iloc[image_idx, 2])
+            if self.dataset_name == "photoface":
+                sample['mask'] = os.path.join(self.data_dir, self.data_info.iloc[image_idx, 3])
+
+            # data augmentation args
+            sample['RandomHorizontalFlip'] = 0.4
+            sample['distortion_prob'] = 0.05
+            sample['to_gray_prob'] = 0.1
+
+            self.samples.append(sample)
+
+
+    def __getitem__(self, index):
+        sample = {}
+        sample['domain'] = torch.Tensor([1., 0., 0.]) # indoor
+        H, W = self.img_size
+        try:
+            sample_path = self.samples[index]
+            sample['rgb'] = read_img(sample_path['rgb'])  # [H, W, 3]
+        except Exception as e:
+            print("Error at index: ", sample_path['rgb'])
+            sample_path = self.samples[index + 1]
+            sample['rgb'] = read_img(sample_path['rgb'])
             
-        return {"rgb": rgb_tensor, "depth": depth_tensor, 'metric': metric_tensor, 'normals': normal_tensor, "val_mask": valid_depth_mask, "domain": "indoor"}
+        if self.dataset_name == "photoface":
+            sample['depth'], sample['normal'], sample["mask"] = read_photoface_dataset(sample_path['depth'], sample_path['normal'], sample_path['mask'])
+        else:
+            sample['depth'], sample['normal'], sample["mask"] = read_depth_normal_synthesis(sample_path['depth'], sample_path['normal'])
 
-    
-# Virtual KITTI 2.0
-class VirtualKITTI2(Dataset):
-    def __init__(self, root_dir, transform=None, near_plane=1e-5, far_plane=80.0):
-        self.root_dir = root_dir
-        self.near_plane = near_plane
-        self.far_plane  = far_plane
-        self.pairs = self._find_pairs()
-        self.transform = SynchronizedTransform_VKITTI() if transform else None
+        H_ori, W_ori = sample['rgb'].shape[:2]
 
-    def _find_pairs(self):
-        scenes = ["Scene01", "Scene02", "Scene06", "Scene18", "Scene20"]
-        weather_conditions = ["morning", "fog", "rain", "sunset", "overcast"]
-        cameras = ["Camera_0", "Camera_1"]
-        vkitti2_rgb_path = os.path.join(self.root_dir, "vkitti_2.0.3_rgb")
-        vkitti2_depth_path =  os.path.join(self.root_dir, "vkitti_2.0.3_depth")
-        vkitti2_normal_path = os.path.join(self.root_dir, "vkitti_DAG_normals")
-        pairs = []
-        for scene in scenes:
-            for weather in weather_conditions:
-                for camera in cameras:
-                    rgb_dir = os.path.join(vkitti2_rgb_path, scene, weather, "frames", "rgb" ,camera)
-                    depth_dir = os.path.join(vkitti2_depth_path, scene, weather, "frames","depth" , camera)
-                    normal_dir = os.path.join(vkitti2_normal_path, scene, weather, "frames", "normal", camera)
-                    if os.path.exists(rgb_dir) and os.path.exists(depth_dir):
-                        rgb_files = [f for f in os.listdir(rgb_dir) if f.endswith(".jpg")]
-                        rgb_files  = [file[3:] for file in rgb_files]
-                        for file in rgb_files:
-                            rgb_file = "rgb" + file
-                            depth_file = "depth" + file.replace('.jpg', '.png')
-                            normal_file = "normal" + file.replace('.jpg', '.png')
-                            rgb_path = os.path.join(rgb_dir, rgb_file)
-                            depth_path = os.path.join(depth_dir, depth_file)
-                            normal_path = os.path.join(normal_dir, normal_file)
-                            pairs.append((rgb_path, depth_path, normal_path))
-        return pairs
+        # 1. Random Crop
+        if H_ori >= H and W_ori >= W:
+            H_start, W_start = np.random.randint(0, H_ori-H+1), np.random.randint(0, W_ori-W+1)
+            sample['rgb'] = sample['rgb'][H_start:H_start + H, W_start:W_start + W]
+            sample['depth'] = sample['depth'][H_start:H_start + H, W_start:W_start + W]
+            sample['normal'] = sample['normal'][H_start:H_start + H, W_start:W_start + W]
+
+        # 2. Random Horizontal Flip
+        if np.random.random() < sample_path['RandomHorizontalFlip']:
+            sample['rgb'] = np.copy(np.fliplr(sample['rgb']))
+            sample['depth'] = np.copy(np.fliplr(sample['depth']))
+            sample['normal'] = np.copy(np.fliplr(sample['normal']))
+            sample['normal'][:,:,0] *= -1.
+
+        # 3. Photometric Distortion
+        to_gray_prob = sample_path['to_gray_prob']
+        distortion_prob = sample_path['distortion_prob']
+        brightness_beta = np.random.uniform(-32, 32)
+        contrast_alpha = np.random.uniform(0.5, 1.5)
+        saturate_alpha = np.random.uniform(0.5, 1.5)
+        rand_hue = np.random.randint(-18, 18)
+
+        brightness_do = np.random.random() < distortion_prob
+        contrast_do = np.random.random() < distortion_prob
+        saturate_do = np.random.random() < distortion_prob
+        rand_hue_do = np.random.random() < distortion_prob
+
+        # mode == 0 --> do random contrast first
+        # mode == 1 --> do random contrast last
+        mode = 0 if np.random.random() > 0.5 else 1
+        if np.random.random() < to_gray_prob:
+            sample['rgb'] = iaa.Grayscale(alpha=(0.8, 1.0))(image=sample['rgb'])
+        else:
+            # random brightness
+            if brightness_do:
+                alpha, beta = 1.0, brightness_beta
+                sample['rgb'] = np.clip((sample['rgb'].astype(np.float32) * alpha + beta), 0, 255).astype(np.uint8)
+
+            if mode == 0:
+                if contrast_do:
+                    alpha, beta = contrast_alpha, 0.0
+                    sample['rgb'] = np.clip((sample['rgb'].astype(np.float32) * alpha + beta), 0, 255).astype(np.uint8)
+
+            # random saturation
+            if saturate_do:
+                img = cv2.cvtColor(sample['rgb'][:,:,::-1], cv2.COLOR_BGR2HSV)
+                alpha, beta = saturate_alpha, 0.0
+                img[:,:,1] = np.clip((img[:,:,1].astype(np.float32) * alpha + beta), 0, 255).astype(np.uint8)
+                sample['rgb'] = cv2.cvtColor(img, cv2.COLOR_HSV2BGR)[:,:,::-1]
+
+            # random hue
+            if rand_hue_do:
+                img = cv2.cvtColor(sample['rgb'][:,:,::-1], cv2.COLOR_BGR2HSV)
+                img[:, :, 0] = (img[:, :, 0].astype(int) + rand_hue) % 180
+                sample['rgb'] = cv2.cvtColor(img, cv2.COLOR_HSV2BGR)[:,:,::-1]
+
+            # random contrast
+            if mode == 1:
+                if contrast_do:
+                    alpha, beta = contrast_alpha, 0.0
+                    sample['rgb'] = np.clip((sample['rgb'].astype(np.float32) * alpha + beta), 0, 255).astype(np.uint8)
+
+        # 4. To Tensor
+        sample['rgb'] = (torch.from_numpy(np.transpose(sample['rgb'].copy(), (2, 0, 1))) / 255.) * 2.0 - 1.0  # [3, H, W]
+        sample['depth'] = torch.from_numpy(sample['depth'][None].copy())  # [1, H, W]
+        sample['normal'] = torch.from_numpy(np.transpose(sample['normal'].copy(), (2, 0, 1)))  # [3, H, W]
+
+        return sample
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.samples)
+    
+    def get_img_size(self):
+        return self.img_size
 
-    def __getitem__(self, idx):
-        rgb_path, depth_path, normal_path = self.pairs[idx]
+    
+# Get Dataset Here
+def prepare_dataset(data_dir=None,
+                    csv_path=None,
+                    dataset_name='synthesis',
+                    batch_size=1,
+                    test_batch=1,
+                    datathread=4,
+                    logger=None):
 
-        # get RGB
-        rgb_image   = Image.open(rgb_path).convert('RGB')
-        # get depth
-        depth_image = cv2.imread(depth_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-        depth_image = depth_image.astype(np.float32)/100.0    # cm to meters
-        depth_image = Image.fromarray(depth_image)            # PIL
-        # get normals
-        normal_image = Image.open(normal_path).convert('RGB') 
-        
-        # transform
-        if self.transform is not None:
-            rgb_tensor, depth_tensor, normal_tensor = self.transform(rgb_image, depth_image, normal_image)
-        else:
-            rgb_tensor    = transforms.ToTensor()(rgb_image)
-            depth_tensor  = transforms.ToTensor()(depth_image)
-            normal_tensor = transforms.ToTensor()(normal_image)
-            
-        # get valid depth mask
-        valid_depth_mask =  (depth_tensor > self.near_plane) & (depth_tensor < self.far_plane)
-            
-        # Process RGB
-        rgb_tensor = rgb_tensor*2.0 - 1.0 # [-1,1]
+    # set the config parameters
+    dataset_config_dict = dict()
+    
+    train_dataset = SynthesisDataset(data_dir=data_dir, csv_path=csv_path, dataset_name=dataset_name)
 
-        # Process depth
-        if valid_depth_mask.any():
-            flat_depth = depth_tensor[valid_depth_mask].flatten().float()
-            min_depth = torch.quantile(flat_depth, 0.02)  
-            max_depth = torch.quantile(flat_depth, 0.98)
-            if min_depth == max_depth:
-                depth_tensor     = torch.zeros_like(depth_tensor)
-                metric_tensor    = torch.zeros_like(depth_tensor)
-                valid_depth_mask = torch.zeros_like(depth_tensor).bool() # empty mask
-            else:
-                depth_tensor = torch.clamp(depth_tensor, min_depth, max_depth) # remove outliers
-                depth_tensor[~valid_depth_mask] = max_depth                    # set invalid depth to relative far plane
-                metric_tensor = depth_tensor.clone()                           # keep metric depth for e2e loss ft   
-                depth_tensor = torch.clamp((((depth_tensor - min_depth) / (max_depth - min_depth))*2.0)-1.0, -1, 1) # [-1,1]
-        else:
-            depth_tensor = torch.zeros_like(depth_tensor)
-            metric_tensor = torch.zeros_like(depth_tensor)
-        depth_tensor   = torch.stack([depth_tensor, depth_tensor, depth_tensor]).squeeze() # stack depth map for VAE encoder
+    img_height, img_width = train_dataset.get_img_size()
 
-        # Process normals
-        normal_tensor = normal_tensor * 2.0 - 1.0                                 # [-1,1]
-        normal_tensor =  torch.nn.functional.normalize(normal_tensor, p=2, dim=0) # normalize
-        # set invalid pixels to the zero vector (color grey)
-        normal_tensor[0,~valid_depth_mask.squeeze()] = 0
-        normal_tensor[1,~valid_depth_mask.squeeze()] = 0
-        normal_tensor[2,~valid_depth_mask.squeeze()] = 0
+    datathread = datathread
+    if os.environ.get('datathread') is not None:
+        datathread = int(os.environ.get('datathread'))
+    
+    if logger is not None:
+        logger.info("Use %d processes to load data..." % datathread)
 
-        return {"rgb": rgb_tensor, "depth": depth_tensor, 'metric': metric_tensor, 'normals': normal_tensor, "val_mask": valid_depth_mask, "domain": "outdoor"}
+    train_loader = DataLoader(train_dataset, batch_size = batch_size, \
+                            shuffle = True, num_workers = datathread, \
+                            pin_memory = True)
+    
+    num_batches_per_epoch = len(train_loader)
+    
+    dataset_config_dict['num_batches_per_epoch'] = num_batches_per_epoch
+    dataset_config_dict['img_size'] = (img_height,img_width)
+    
+    return train_loader, dataset_config_dict
+
+
+def resize_max_res_tensor(input_tensor, mode, recom_resolution=768):
+    assert input_tensor.shape[1]==3
+    original_H, original_W = input_tensor.shape[2:]
+    downscale_factor = min(recom_resolution/original_H, recom_resolution/original_W)
+    
+    if mode == 'normal':
+        resized_input_tensor = F.interpolate(input_tensor,
+                                            scale_factor=downscale_factor,
+                                            mode='nearest')
+    else:
+        resized_input_tensor = F.interpolate(input_tensor,
+                                            scale_factor=downscale_factor,
+                                            mode='bilinear',
+                                            align_corners=False)
+    
+    return resized_input_tensor
+
+def depth_scale_shift_normalization(depth):
+
+    bsz = depth.shape[0]
+
+    depth_ = depth[:,0,:,:].reshape(bsz,-1).cpu().numpy()
+    min_value = torch.from_numpy(np.percentile(a=depth_,q=2,axis=1)).to(depth)[...,None,None,None]
+    max_value = torch.from_numpy(np.percentile(a=depth_,q=98,axis=1)).to(depth)[...,None,None,None]
+
+    normalized_depth = ((depth - min_value)/(max_value-min_value+1e-5) - 0.5) * 2
+    normalized_depth = torch.clip(normalized_depth, -1., 1.)
+
+    return normalized_depth

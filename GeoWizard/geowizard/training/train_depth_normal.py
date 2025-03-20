@@ -22,6 +22,9 @@ import tqdm
 
 import sys
 
+import sys
+sys.path.append("..")
+
 from accelerate import Accelerator
 import numpy as np
 from accelerate.logging import get_logger
@@ -29,7 +32,7 @@ from accelerate.utils import set_seed
 from accelerate.utils import ProjectConfiguration, set_seed
 import shutil
 
-from diffusers import DDPMScheduler, AutoencoderKL
+from diffusers import DDPMScheduler, AutoencoderKL, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import  is_wandb_available # check_min_version
@@ -38,11 +41,12 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 from packaging import version
 from tqdm.auto import tqdm
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import CLIPTextModel, CLIPTokenizer
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 import accelerate
-
+from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
 # add
 if is_wandb_available():
     import wandb
@@ -52,8 +56,8 @@ from GeoWizard.geowizard.models.unet_2d_condition import UNet2DConditionModel
 from torch.optim.lr_scheduler import LambdaLR
 from training.util.lr_scheduler import IterExponential
 from training.util.loss import ScaleAndShiftInvariantLoss, AngularLoss
-from training.dataloaders.load import MixedDataLoader, Hypersim, VirtualKITTI2
-
+from training.dataloaders.load import prepare_dataset, depth_scale_shift_normalization, resize_max_res_tensor
+from utils.train_validation import log_photoface_validation, log_validation
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.26.0.dev0")
 
@@ -88,12 +92,74 @@ def parse_args():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
+
+    parser.add_argument(
+        "--fined_tune_from_checkpoint",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="/data/",
+        required=True,
+        help="The Root Dataset Path.",
+    )
+
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="photoface",
+        help="The dataset name.",
+    )
+
+
+    parser.add_argument(
+        "--csv_train_path",
+        type=str,
+        default="/data/synthesis.csv",
+        required=True,
+        help="Path to train dataset csv"
+    )
+
+    parser.add_argument(
+        "--csv_valid_path",
+        type=str,
+        default="/data/synthesis.csv",
+        required=True,
+        help="Path to train dataset csv"
+    )
+
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+
+    parser.add_argument(
+        "--recom_resolution",
+        type=int,
+        default=768,
+        help=(
+            "The resolution for resizeing the input images and the depth/disparity to make full use of the pre-trained model from \
+                from the stable diffusion vae, for common cases, do not change this parameter"
+        ),
+    )
+
     parser.add_argument(
         "--output_dir",
         type=str,
         default="training/model-finetuned", # add
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+
     parser.add_argument(
         "--seed", 
         type=int, 
@@ -111,6 +177,16 @@ def parse_args():
         type=int, 
         default=None # add
     )
+
+        # validations every 5 Epochs
+    parser.add_argument(
+        "--validation_epochs",
+        type=int,
+        default=2,
+        help="Run validation every X epochs.",
+    )
+
+
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -281,6 +357,8 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    if args.dataset_name == "photoface":
+        args.dataset_path = ""
     return args
 
 def pyramid_noise_like(x, timesteps, discount=0.9):
@@ -300,8 +378,13 @@ def main():
     ''' ------------------------Configs Preparation----------------------------'''
     # give the args parsers
     args = parse_args()
+    torch.backends.cuda.matmul.allow_tf32 = True
     # save  the tensorboard log files
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=logging_dir)
+    Path(logging_dir).mkdir(exist_ok=True, parents=True)
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     # tell the gradient_accumulation_steps, mix precison, and tensorboard
@@ -339,22 +422,21 @@ def main():
         file.write(args_str)
     
     ''' ------------------------Non-NN Modules Definition----------------------------'''
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder='scheduler')
-    sd_image_variations_diffusers_path = 'lambdalabs/sd-image-variations-diffusers'
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_image_variations_diffusers_path, subfolder="image_encoder")
-    feature_extractor = CLIPImageProcessor.from_pretrained(sd_image_variations_diffusers_path, subfolder="feature_extractor")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae')
     # add
     # no modification are made to the UNet since we fine-tune GeoWizard.
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder='scheduler')
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder='tokenizer')
+    logger.info("loading the noise scheduler and the tokenizer from {}".format(args.pretrained_model_name_or_path), main_process_only=True)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae')
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder='text_encoder')
 
-    # using EMA
-    if args.use_ema:
-        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
+    # add
+    # no modification are made to the UNet since we fine-tune GeoWizard.
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet_v2")
 
     # Freeze vae and set unet to trainable.
     vae.requires_grad_(False)
-    image_encoder.requires_grad_(False)
+    text_encoder.requires_grad_(False)
     unet.train() # only make the unet-trainable        
 
     # using xformers for efficient attentions.
@@ -445,16 +527,13 @@ def main():
 
     # get the training dataset
     with accelerator.main_process_first():
-
-        # add 
-        # Load datasets
-        hypersim_root_dir = "data/hypersim/processed"
-        vkitti_root_dir   = "data/virtual_kitti_2"
-        train_dataset_hypersim = Hypersim(root_dir=hypersim_root_dir, transform=True)
-        train_dataset_vkitti   = VirtualKITTI2(root_dir=vkitti_root_dir, transform=True)
-        train_dataloader_vkitti   = torch.utils.data.DataLoader(train_dataset_vkitti,   shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
-        train_dataloader_hypersim = torch.utils.data.DataLoader(train_dataset_hypersim, shuffle=True, batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers)
-        train_loader = MixedDataLoader(train_dataloader_hypersim, train_dataloader_vkitti, split1=9, split2=1)
+        train_loader, dataset_config_dict = prepare_dataset(data_dir=args.dataset_path,
+                                                        csv_path=args.csv_train_path,
+                                                        dataset_name=args.dataset_name,
+                                                        batch_size=args.train_batch_size,
+                                                        test_batch=1,
+                                                        datathread=args.dataloader_num_workers,
+                                                        logger=logger)
 
     # because the optimizer not optimized every time, so we need to calculate how many steps it optimizes,
     # it is usually optimized by 
@@ -486,6 +565,7 @@ def main():
     )
 
     if args.use_ema:
+        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
         ema_unet.to(accelerator.device)
 
     # For mixed precision training we cast all non-trainable weigths to half-precision
@@ -499,11 +579,8 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     # Move text_encode and vae to gpu and cast to weight_dtype
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    image_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    clip_image_mean = torch.as_tensor(feature_extractor.image_mean)[:,None,None].to(accelerator.device, dtype=torch.float32)
-    clip_image_std  = torch.as_tensor(feature_extractor.image_std)[:,None,None].to(accelerator.device, dtype=torch.float32)
 
     # We need to initialize the trackers we use, and also store our configuration.
     num_update_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
@@ -528,7 +605,7 @@ def main():
         return model
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset_vkitti)+len(train_dataset_hypersim)}") # add
+    logger.info(f"  Num examples = {len(train_loader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -574,6 +651,21 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+      # Encode text embedding for prompt
+    prompt_list = ['indoor geometry', 'outdoor geometry', 'object geometry']
+    text_embed_list = []
+    for prompt in prompt_list:
+        text_inputs =tokenizer(
+            prompt,
+            padding="do_not_pad",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids.to(text_encoder.device)
+        text_embed = text_encoder(text_input_ids)[0].to(weight_dtype)
+        text_embed_list.append(text_embed)
+
     # add 
     # Init task specific losses
     ssi_loss          = ScaleAndShiftInvariantLoss()
@@ -596,29 +688,23 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(unet):
-                
-                # add
-                # RGB
-                image_data_resized = batch['rgb'].to(accelerator.device,dtype=weight_dtype)
-                # Depth
-                depth_resized_normalized = batch['depth'].to(accelerator.device,dtype=weight_dtype)
-                # Validation mask
-                val_mask = batch["val_mask"].to(accelerator.device)
-                invalid_mask  = ~val_mask
-                latent_mask   = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool()
-                latent_mask   = latent_mask.repeat((2, 4, 1, 1)).detach() 
-                # Surface normals
-                normal_resized = batch['normals'].to(accelerator.device,dtype=weight_dtype)*-1 # GeoWizard trains on inverted normals!
+                 # convert the images and the depths into lantent space.
+                image_data = batch['rgb'].clip(-1., 1.)
+                image_data_resized = resize_max_res_tensor(image_data, mode='rgb')
 
-                # Compute CLIP image embeddings
-                imgs_in_proc = TF.resize((image_data_resized +1)/2, 
-                    (feature_extractor.crop_size['height'], feature_extractor.crop_size['width']), 
-                    interpolation=InterpolationMode.BICUBIC, 
-                    antialias=True
-                )
-                # do the normalization in float32 to preserve precision
-                imgs_in_proc = ((imgs_in_proc.float() - clip_image_mean) / clip_image_std).to(weight_dtype)        
-                imgs_embed = image_encoder(imgs_in_proc).image_embeds.unsqueeze(1).to(weight_dtype)
+                device = image_data.device
+                
+                depth = batch['depth']
+                depth_stacked = depth.repeat(1,3,1,1)
+                depth_resized = resize_max_res_tensor(depth_stacked, mode='depth') 
+
+                depth_resized_normalized = depth_scale_shift_normalization(depth_resized)
+
+                normal = batch['normal'].clip(-1., 1.)
+                normal_resized = resize_max_res_tensor(normal, mode='normal')
+
+                mask = batch['mask']
+                mask_resized = resize_max_res_tensor(mask, mode='normal')
 
                 # encode latents
                 with torch.no_grad():
@@ -651,17 +737,9 @@ def main():
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=depth_latents.device).repeat(2)
                     timesteps = timesteps.long()
 
-                # add
-                # Sample noise
-                if args.noise_type == "zeros":
-                    noise = torch.zeros_like(geo_latents).to(accelerator.device)
-                elif args.noise_type == "pyramid":
-                    noise = pyramid_noise_like(geo_latents, timesteps).to(accelerator.device)
-                elif args.noise_type == "gaussian":
-                    noise = torch.randn_like(geo_latents).to(accelerator.device)
-                else:
-                    raise ValueError(f"Unknown noise type {args.noise_type}")
-                
+              
+                noise = pyramid_noise_like(geo_latents, timesteps).to(accelerator.device)
+    
                 # add
                 # Add noise to the depth latents
                 if args.e2e_ft:
@@ -681,24 +759,20 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                batch_imgs_embed = imgs_embed.repeat((2, 1, 1))  # [B*2, 1, 768]
-
+                batch_imgs_embed = torch.zeros_like(text_embed_list[0]).repeat((bsz, 1, 1))
+                for i in range(len(batch['domain'])):
+                    if batch['domain'][i][0].item() == 1:
+                        batch_text_embed[i] = text_embed_list[0]
+                    elif batch['domain'][i][1].item() == 1:
+                        batch_text_embed[i] = text_embed_list[1]
+                    elif batch['domain'][i][2].item() == 1:
+                        batch_text_embed[i] = text_embed_list[2]
+                batch_text_embed = batch_text_embed.repeat((2, 1, 1))  # [B*2, 4, 1024]
                 # hybrid hierarchical switcher 
                 geo_class = torch.tensor([[0, 1], [1, 0]], dtype=weight_dtype, device=accelerator.device)
                 geo_embedding = torch.cat([torch.sin(geo_class), torch.cos(geo_class)], dim=-1).repeat_interleave(bsz, 0)
 
-                # add
-                # Domain class
-                if batch["domain"][0] == 'indoor':
-                    domain_class = torch.tensor([[1., 0., 0]], device=accelerator.device, dtype=weight_dtype)
-                elif batch["domain"][0] == 'outdoor':
-                    domain_class = torch.tensor([[0., 1., 0]], device=accelerator.device, dtype=weight_dtype)
-                else:
-                    raise ValueError(f"Unknown domain {batch['domain'][0]}")
-                domain_class = domain_class.repeat(bsz, 1)
-
-                domain_embedding = torch.cat([torch.sin(domain_class), torch.cos(domain_class)], dim=-1).repeat(2,1).to(accelerator.device)
-                class_embedding = torch.cat((geo_embedding, domain_embedding), dim=-1)
+                class_embedding = geo_embedding
 
                 # predict the noise residual and compute the loss.
                 unet_input = torch.cat((rgb_latents.repeat(2,1,1,1), noisy_geo_latents), dim=1)
@@ -711,61 +785,54 @@ def main():
                 # add
                 # Compute loss
                 loss = torch.tensor(0.0, device=accelerator.device, requires_grad=True)
-                if latent_mask.any():
-                    if not args.e2e_ft:
-                        # Diffusion loss
-                        loss = F.mse_loss(noise_pred[latent_mask].float(), target[latent_mask].float(), reduction="mean")
-                    else:
-                        # End-to-end task specific fine-tuning loss
-                        # Convert parameterized prediction into latent prediction.
-                        # Code is based on the DDIM code from diffusers,
-                        # https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_ddim.py.
-                        alpha_prod_t = alpha_prod[timesteps].view(-1, 1, 1, 1)
-                        beta_prod_t  =  beta_prod[timesteps].view(-1, 1, 1, 1)
-                        if noise_scheduler.config.prediction_type == "v_prediction":
-                            current_latent_estimate = (alpha_prod_t**0.5) * noisy_geo_latents - (beta_prod_t**0.5) * noise_pred
-                        elif noise_scheduler.config.prediction_type == "epsilon":
-                            current_latent_estimate = (noisy_geo_latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
-                        else:
-                            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                        # clip or threshold prediction (only here for completeness, not used by SD2 or our models with v_prediction)
-                        if noise_scheduler.config.thresholding:
-                            pred_original_sample = noise_scheduler._threshold_sample(pred_original_sample)
-                        elif noise_scheduler.config.clip_sample:
-                            pred_original_sample = pred_original_sample.clamp(
-                                -noise_scheduler.config.clip_sample_range, noise_scheduler.config.clip_sample_range
-                            )
-                        # Decode the latent estimate
-                        current_latent_estimate = current_latent_estimate / vae.config.scaling_factor
-                        z = vae.post_quant_conv(current_latent_estimate)
-                        current_estimate = vae.decoder(z)
-                        current_depth_estimate, current_normal_estimate = torch.chunk(current_estimate, 2, dim=0)
-                        # Process depth and get GT
-                        current_depth_estimate = current_depth_estimate.mean(dim=1, keepdim=True) 
-                        current_depth_estimate = torch.clamp(current_depth_estimate,-1,1) 
-                        depth_ground_truth = batch["metric"].to(device=accelerator.device, dtype=weight_dtype)
-                        # Process normals and get GT
-                        norm = torch.norm(current_normal_estimate, p=2, dim=1, keepdim=True) + 1e-5
-                        current_normal_estimate = current_normal_estimate / norm
-                        current_normal_estimate = torch.clamp(current_normal_estimate,-1,1) 
-                        normal_ground_truth = batch["normals"].to(device=accelerator.device, dtype=weight_dtype) * -1 # GeoWizard trains on inverted normals!
-                        # Compute task-specific loss             
-                        estimation_loss = 0
-                        depth_scale  = 0.5 # ssi loss is roughly 2x the angular loss
-                        normal_scale = 1.0
-                        # Scale and shift invariant loss
-                        estimation_loss_ssi = ssi_loss(current_depth_estimate, depth_ground_truth, val_mask)
-                        if not torch.isnan(estimation_loss_ssi).any():
-                            estimation_loss = estimation_loss + (estimation_loss_ssi*depth_scale)
-                            loss_logger["ssi"] += estimation_loss_ssi.detach().item()   
-                            loss_logger["ssi_count"] += 1
-                        # Angular loss
-                        estimation_loss_ang_norm = angular_loss_norm(current_normal_estimate, normal_ground_truth, val_mask)
-                        if not torch.isnan(estimation_loss_ang_norm).any():
-                            estimation_loss = estimation_loss + (estimation_loss_ang_norm*normal_scale)
-                            loss_logger["normals_angular"] += estimation_loss_ang_norm.detach().item()   
-                            loss_logger["normals_angular_count"] += 1
-                        loss = loss + estimation_loss
+                # End-to-end task specific fine-tuning loss
+                # Convert parameterized prediction into latent prediction.
+                # Code is based on the DDIM code from diffusers,
+                # https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_ddim.py.
+                alpha_prod_t = alpha_prod[timesteps].view(-1, 1, 1, 1)
+                beta_prod_t  =  beta_prod[timesteps].view(-1, 1, 1, 1)
+                if noise_scheduler.config.prediction_type == "v_prediction":
+                    current_latent_estimate = (alpha_prod_t**0.5) * noisy_geo_latents - (beta_prod_t**0.5) * noise_pred
+                elif noise_scheduler.config.prediction_type == "epsilon":
+                    current_latent_estimate = (noisy_geo_latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                # clip or threshold prediction (only here for completeness, not used by SD2 or our models with v_prediction)
+                if noise_scheduler.config.thresholding:
+                    pred_original_sample = noise_scheduler._threshold_sample(pred_original_sample)
+                elif noise_scheduler.config.clip_sample:
+                    pred_original_sample = pred_original_sample.clamp(
+                        -noise_scheduler.config.clip_sample_range, noise_scheduler.config.clip_sample_range
+                    )
+                # Decode the latent estimate
+                current_latent_estimate = current_latent_estimate / vae.config.scaling_factor
+                z = vae.post_quant_conv(current_latent_estimate)
+                current_estimate = vae.decoder(z)
+                current_depth_estimate, current_normal_estimate = torch.chunk(current_estimate, 2, dim=0)
+                # Process depth and get GT
+                current_depth_estimate = current_depth_estimate.mean(dim=1, keepdim=True) 
+                current_depth_estimate = torch.clamp(current_depth_estimate,-1,1)
+                # Process normals and get GT
+                norm = torch.norm(current_normal_estimate, p=2, dim=1, keepdim=True) + 1e-5
+                current_normal_estimate = current_normal_estimate / norm
+                current_normal_estimate = torch.clamp(current_normal_estimate,-1,1) 
+                # Compute task-specific loss             
+                estimation_loss = 0
+                depth_scale  = 1.0 # ssi loss is roughly 2x the angular loss
+                normal_scale = 1.0
+                # Scale and shift invariant loss
+                estimation_loss_ssi = ssi_loss(current_depth_estimate, depth_resized_normalized, mask_resized)
+                if not torch.isnan(estimation_loss_ssi).any():
+                    estimation_loss = estimation_loss + (estimation_loss_ssi*depth_scale)
+                    loss_logger["ssi"] += estimation_loss_ssi.detach().item()   
+                    loss_logger["ssi_count"] += 1
+                # Angular loss
+                estimation_loss_ang_norm = angular_loss_norm(current_normal_estimate, normal_resized, mask_resized)
+                if not torch.isnan(estimation_loss_ang_norm).any():
+                    estimation_loss = estimation_loss + (estimation_loss_ang_norm*normal_scale)
+                    loss_logger["normals_angular"] += estimation_loss_ang_norm.detach().item()   
+                    loss_logger["normals_angular_count"] += 1
+                loss = loss + estimation_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -779,7 +846,8 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-            
+            writer.add_scalar('train/ssi_loss', loss_logger["ssi"], global_step)
+            writer.add_scalar('train/normals_angular_loss', loss_logger["normals_angular"], global_step)
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -848,28 +916,34 @@ def main():
             if args.use_ema:
                 # Switch back to the original UNet parameters.
                 ema_unet.restore(unet.parameters())
-
-    # add        
-    # Create GeoWizard pipeline using the trained modules and save it.
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unet = unwrap_model(unet)
-        scheduler = DDPMScheduler.from_pretrained(
-            args.pretrained_model_name_or_path, 
-            subfolder="scheduler", 
-            timestep_spacing="trailing" # set scheduler timestep spacing to trailing for later inference.
-        )
-        pipeline = DepthNormalEstimationPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                vae=vae,
-                unet=unet,
-                scheduler=scheduler,
-                image_encoder=image_encoder,
-                feature_extractor=feature_extractor
-        )
-        logger.info(f"Saving pipeline to {args.output_dir}")
-        pipeline.save_pretrained(args.output_dir)
-    logger.info(f"Finished training.")
+                       # validation inference here
+            if (epoch) % args.validation_epochs == 0:
+                if args.dataset_name == "photoface":
+                    val_mean, val_std, acc_list = log_photoface_validation(
+                        vae=vae,
+                        text_encoder=text_encoder,
+                        tokenizer=tokenizer,
+                        unet=unet,
+                        args=args,
+                        scheduler=noise_scheduler,
+                        epoch=epoch,
+                    )
+                else:
+                    val_mean, val_std, acc_list = log_validation(
+                        vae=vae,
+                        text_encoder=text_encoder,
+                        tokenizer=tokenizer,
+                        unet=unet,
+                        args=args,
+                        scheduler=noise_scheduler,
+                        epoch=epoch,
+                    )
+                # Log the validation results to tensorboard
+                accelerator.log({"val_mean": val_mean, "val_std": val_std}, step=global_step)
+                accelerator.log({"val_acc": acc_list}, step=global_step)
+            if args.use_ema:
+                # Switch back to the original UNet parameters.
+                ema_unet.restore(unet.parameters())
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
