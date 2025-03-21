@@ -46,23 +46,50 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 import accelerate
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import LambdaLR
+
 from pathlib import Path
 # add
 if is_wandb_available():
     import wandb
 sys.path.append(os.getcwd())
-from GeoWizard.geowizard.models.geowizard_pipeline import DepthNormalEstimationPipeline
-from GeoWizard.geowizard.models.unet_2d_condition import UNet2DConditionModel
-from torch.optim.lr_scheduler import LambdaLR
-from training.util.lr_scheduler import IterExponential
-from training.util.loss import ScaleAndShiftInvariantLoss, AngularLoss
-from training.dataloaders.load import prepare_dataset, depth_scale_shift_normalization, resize_max_res_tensor
+from models.unet_2d_condition import UNet2DConditionModel
+from utils.loss import ScaleAndShiftInvariantLoss, AngularLoss
+from utils.load import prepare_dataset, depth_scale_shift_normalization, resize_max_res_tensor
 from utils.train_validation import log_photoface_validation, log_validation
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
+import numpy as np
 
+class IterExponential:
+    
+    def __init__(self, total_iter_length, final_ratio, warmup_steps=0) -> None:
+        """
+        Customized iteration-wise exponential scheduler.
+        Re-calculate for every step, to reduce error accumulation
+
+        Args:
+            total_iter_length (int): Expected total iteration number
+            final_ratio (float): Expected LR ratio at n_iter = total_iter_length
+        """
+        self.total_length = total_iter_length
+        self.effective_length = total_iter_length - warmup_steps
+        self.final_ratio = final_ratio
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, n_iter) -> float:
+        if n_iter < self.warmup_steps:
+            alpha = 1.0 * n_iter / self.warmup_steps
+        elif n_iter >= self.total_length:
+            alpha = self.final_ratio
+        else:
+            actual_iter = n_iter - self.warmup_steps
+            alpha = np.exp(
+                actual_iter / self.effective_length * np.log(self.final_ratio)
+            )
+        return alpha
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GeoWizard")
@@ -83,6 +110,14 @@ def parse_args():
         type=int,
         default=20000,
     )
+    
+    parser.add_argument(
+        "--output_valid_dir",
+        type=str,
+        default="valid",
+        help="Validation directory.",
+    )
+    
     
     # GeoWizard Settings
     parser.add_argument(
@@ -146,7 +181,7 @@ def parse_args():
     parser.add_argument(
         "--recom_resolution",
         type=int,
-        default=768,
+        default=512,
         help=(
             "The resolution for resizeing the input images and the depth/disparity to make full use of the pre-trained model from \
                 from the stable diffusion vae, for common cases, do not change this parameter"
@@ -424,11 +459,12 @@ def main():
     ''' ------------------------Non-NN Modules Definition----------------------------'''
     # add
     # no modification are made to the UNet since we fine-tune GeoWizard.
+    stable_diffusion_path = "stabilityai/stable-diffusion-2"
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder='scheduler')
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder='tokenizer')
+    tokenizer = CLIPTokenizer.from_pretrained(stable_diffusion_path, subfolder='tokenizer')
     logger.info("loading the noise scheduler and the tokenizer from {}".format(args.pretrained_model_name_or_path), main_process_only=True)
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae')
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder='text_encoder')
+    text_encoder = CLIPTextModel.from_pretrained(stable_diffusion_path, subfolder='text_encoder')
 
     # add
     # no modification are made to the UNet since we fine-tune GeoWizard.
@@ -544,8 +580,6 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    # add
-    # Scheduler
     if args.lr_scheduler == "exponential":
         lr_func      = IterExponential(total_iter_length = args.lr_total_iter_length*accelerator.num_processes, final_ratio = 0.01, warmup_steps = args.lr_warmup_steps*accelerator.num_processes)
         lr_scheduler = LambdaLR(optimizer= optimizer, lr_lambda=lr_func)
@@ -558,7 +592,7 @@ def main():
         )
     else:
         raise ValueError(f"Unknown lr_scheduler {args.lr_scheduler}")
-
+    
     # Prepare everything with our `accelerator`.
     unet, optimizer, train_loader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_loader, lr_scheduler
@@ -665,7 +699,10 @@ def main():
         text_input_ids = text_inputs.input_ids.to(text_encoder.device)
         text_embed = text_encoder(text_input_ids)[0].to(weight_dtype)
         text_embed_list.append(text_embed)
-
+    # del text_encoder
+    # del tokenizer
+    # import gc
+    # gc.collect()
     # add 
     # Init task specific losses
     ssi_loss          = ScaleAndShiftInvariantLoss()
@@ -695,23 +732,28 @@ def main():
                 device = image_data.device
                 
                 depth = batch['depth']
-                depth_stacked = depth.repeat(1,3,1,1)
-                depth_resized = resize_max_res_tensor(depth_stacked, mode='depth') 
+                # depth_stacked = depth.repeat(1,3,1,1)
+                depth_resized = resize_max_res_tensor(depth, mode='depth')
 
                 depth_resized_normalized = depth_scale_shift_normalization(depth_resized)
 
                 normal = batch['normal'].clip(-1., 1.)
                 normal_resized = resize_max_res_tensor(normal, mode='normal')
 
-                mask = batch['mask']
-                mask_resized = resize_max_res_tensor(mask, mode='normal')
+
+                mask = batch['mask'].to(image_data_resized.dtype).unsqueeze(1)
+                mask_resized = resize_max_res_tensor(mask, mode='normal').to(weight_dtype)
+    
+
+                mask_resized = mask_resized.to(torch.bool)
+                #.repeat(1,3,1,1)
 
                 # encode latents
                 with torch.no_grad():
                     if args.e2e_ft:
                         # add
                         # When E2E FT, we only need to encode the RGB image
-                        h_batch = vae.encoder(image_data_resized)
+                        h_batch = vae.encoder(image_data_resized.to(weight_dtype))
                         moments_batch = vae.quant_conv(h_batch)
                         mean_batch, _ = torch.chunk(moments_batch, 2, dim=1)
                         rgb_latents   = mean_batch * vae.config.scaling_factor
@@ -759,7 +801,7 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                batch_imgs_embed = torch.zeros_like(text_embed_list[0]).repeat((bsz, 1, 1))
+                batch_text_embed = torch.zeros_like(text_embed_list[0]).repeat((bsz, 1, 1))  # [B, 4, 1024]
                 for i in range(len(batch['domain'])):
                     if batch['domain'][i][0].item() == 1:
                         batch_text_embed[i] = text_embed_list[0]
@@ -779,7 +821,7 @@ def main():
 
                 noise_pred = unet(unet_input, 
                                 timesteps, 
-                                encoder_hidden_states=batch_imgs_embed,
+                                encoder_hidden_states=batch_text_embed,
                                 class_labels=class_embedding).sample #[B, 4, h, w]
                 
                 # add
@@ -806,7 +848,7 @@ def main():
                     )
                 # Decode the latent estimate
                 current_latent_estimate = current_latent_estimate / vae.config.scaling_factor
-                z = vae.post_quant_conv(current_latent_estimate)
+                z = vae.post_quant_conv(current_latent_estimate.to(weight_dtype))
                 current_estimate = vae.decoder(z)
                 current_depth_estimate, current_normal_estimate = torch.chunk(current_estimate, 2, dim=0)
                 # Process depth and get GT
@@ -837,12 +879,10 @@ def main():
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
