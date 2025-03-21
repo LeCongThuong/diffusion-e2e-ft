@@ -56,40 +56,12 @@ sys.path.append(os.getcwd())
 from models.unet_2d_condition import UNet2DConditionModel
 from utils.loss import ScaleAndShiftInvariantLoss, AngularLoss
 from utils.load import prepare_dataset, depth_scale_shift_normalization, resize_max_res_tensor
+from utils.lr_scheduler import IterExponential
 from utils.train_validation import log_photoface_validation, log_validation
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
-import numpy as np
-
-class IterExponential:
-    
-    def __init__(self, total_iter_length, final_ratio, warmup_steps=0) -> None:
-        """
-        Customized iteration-wise exponential scheduler.
-        Re-calculate for every step, to reduce error accumulation
-
-        Args:
-            total_iter_length (int): Expected total iteration number
-            final_ratio (float): Expected LR ratio at n_iter = total_iter_length
-        """
-        self.total_length = total_iter_length
-        self.effective_length = total_iter_length - warmup_steps
-        self.final_ratio = final_ratio
-        self.warmup_steps = warmup_steps
-
-    def __call__(self, n_iter) -> float:
-        if n_iter < self.warmup_steps:
-            alpha = 1.0 * n_iter / self.warmup_steps
-        elif n_iter >= self.total_length:
-            alpha = self.final_ratio
-        else:
-            actual_iter = n_iter - self.warmup_steps
-            alpha = np.exp(
-                actual_iter / self.effective_length * np.log(self.final_ratio)
-            )
-        return alpha
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GeoWizard")
@@ -457,18 +429,17 @@ def main():
         file.write(args_str)
     
     ''' ------------------------Non-NN Modules Definition----------------------------'''
-    # add
+
     # no modification are made to the UNet since we fine-tune GeoWizard.
-    stable_diffusion_path = "stabilityai/stable-diffusion-2"
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder='scheduler')
-    tokenizer = CLIPTokenizer.from_pretrained(stable_diffusion_path, subfolder='tokenizer')
-    logger.info("loading the noise scheduler and the tokenizer from {}".format(args.pretrained_model_name_or_path), main_process_only=True)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae')
-    text_encoder = CLIPTextModel.from_pretrained(stable_diffusion_path, subfolder='text_encoder')
+    noise_scheduler = DDPMScheduler.from_pretrained(args.fined_tune_from_checkpoint, subfolder='scheduler')
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder='tokenizer')
+    logger.info("loading the noise scheduler and the tokenizer from {}".format(args.fined_tune_from_checkpoint), main_process_only=True)
+    vae = AutoencoderKL.from_pretrained(args.fined_tune_from_checkpoint, subfolder='vae')
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder='text_encoder')
 
     # add
     # no modification are made to the UNet since we fine-tune GeoWizard.
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet_v2")
+    unet = UNet2DConditionModel.from_pretrained(args.fined_tune_from_checkpoint, subfolder="unet_v2")
 
     # Freeze vae and set unet to trainable.
     vae.requires_grad_(False)
@@ -955,6 +926,7 @@ def main():
 
                        # validation inference here
             if (epoch) % args.validation_epochs == 0:
+                noise_scheduler.timestep_spacing = "trailing"
                 if args.dataset_name == "photoface":
                     val_mean, val_std, acc_list = log_photoface_validation(
                         vae=vae,
@@ -975,6 +947,8 @@ def main():
                         scheduler=noise_scheduler,
                         epoch=epoch,
                     )
+                noise_scheduler.timestep_spacing = "leading"
+
                 # Log the validation results to tensorboard
                 accelerator.log({"val_mean": val_mean, "val_std": val_std}, step=global_step)
                 accelerator.log({"val_acc": acc_list}, step=global_step)

@@ -280,7 +280,7 @@ def  log_validation(
     n_images = len(data_info)
     logging.info(f"Found {n_images} images")
 
-    denoise_steps = 50
+    denoise_steps = 1
     ensemble_size= 1
     processing_res = 512
     match_input_res = True
@@ -384,7 +384,7 @@ def  log_photoface_validation(
     n_images = len(data_info)
     logging.info(f"Found {n_images} images")
 
-    denoise_steps = 50
+    denoise_steps = 1
     ensemble_size= 1
     processing_res = 512
     match_input_res = True

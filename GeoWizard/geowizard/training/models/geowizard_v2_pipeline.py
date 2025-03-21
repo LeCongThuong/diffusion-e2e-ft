@@ -21,6 +21,20 @@ from utils.depth_ensemble import ensemble_depths
 from utils.normal_ensemble import ensemble_normals
 from utils.batch_size import find_batch_size
 import cv2
+import torch.nn as nn
+
+
+def pyramid_noise_like(x, timesteps, discount=0.9):
+    b, c, w_ori, h_ori = x.shape 
+    u = nn.Upsample(size=(w_ori, h_ori), mode='bilinear')
+    noise = torch.randn_like(x)
+    scale = 1.5
+    for i in range(10):
+        r = np.random.random()*scale + scale # Rather than always going 2x, 
+        w, h = max(1, int(w_ori/(r**i))), max(1, int(h_ori/(r**i)))
+        noise += u(torch.randn(b, c, w, h).to(x)) * (timesteps[...,None,None,None]/1000) * discount**i
+        if w==1 or h==1: break # Lowest resolution is 1x1
+    return noise/noise.std() # Scaled back to roughly unit variance
 
 class DepthNormalPipelineOutput(BaseOutput):
     """
@@ -92,6 +106,7 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
         assert processing_res >=0
         assert denoising_steps >=1
         assert ensemble_size >=1
+        self.scheduler.timestep_spacing = "trailing"
 
         # --------------- Image Processing ------------------------
         # Resize image
@@ -219,7 +234,8 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
     def single_infer(self,input_rgb:torch.Tensor,
                      num_inference_steps:int,
                      domain:str,
-                     show_pbar:bool,):
+                     show_pbar:bool,
+                     noise="zeros",):
 
         device = input_rgb.device
 
@@ -231,7 +247,16 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
         rgb_latent = self.encode_RGB(input_rgb)
         
         # Initial geometric maps (Guassian noise)
-        geo_latent = torch.randn(rgb_latent.shape, device=device, dtype=self.dtype).repeat(2,1,1,1)
+           # add
+        # Initial geometric maps
+        if noise == "gaussian":
+            geo_latent = torch.randn(rgb_latent.shape, device=device, dtype=self.dtype).repeat(2,1,1,1)
+        elif noise == "zeros":
+            geo_latent = torch.zeros(rgb_latent.shape, device=device, dtype=self.dtype).repeat(2,1,1,1)
+        elif noise == "pyramid":
+            geo_latent = pyramid_noise_like(rgb_latent, timesteps).repeat(2,1,1,1)
+        else:
+            raise ValueError(f"Invalid noise type: {noise}")
         rgb_latent = rgb_latent.repeat(2,1,1,1)
         
         # hybrid switcher 
