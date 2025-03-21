@@ -189,7 +189,7 @@ def parse_args():
     parser.add_argument(
         "--validation_epochs",
         type=int,
-        default=2,
+        default=1,
         help="Run validation every X epochs.",
     )
 
@@ -751,7 +751,14 @@ def main():
                     timesteps = timesteps.long()
 
               
-                noise = pyramid_noise_like(geo_latents, timesteps).to(accelerator.device)
+                if args.noise_type == "zeros":
+                    noise = torch.zeros_like(geo_latents).to(accelerator.device)
+                elif args.noise_type == "pyramid":
+                    noise = pyramid_noise_like(geo_latents, timesteps).to(accelerator.device)
+                elif args.noise_type == "gaussian":
+                    noise = torch.randn_like(geo_latents).to(accelerator.device)
+                else:
+                    raise ValueError(f"Unknown noise type {args.noise_type}")
     
                 # add
                 # Add noise to the depth latents
