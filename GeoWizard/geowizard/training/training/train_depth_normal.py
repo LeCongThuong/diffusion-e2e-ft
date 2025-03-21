@@ -953,9 +953,6 @@ def main():
                 ema_unet.store(unet.parameters())
                 ema_unet.copy_to(unet.parameters())
 
-            if args.use_ema:
-                # Switch back to the original UNet parameters.
-                ema_unet.restore(unet.parameters())
                        # validation inference here
             if (epoch) % args.validation_epochs == 0:
                 if args.dataset_name == "photoface":
